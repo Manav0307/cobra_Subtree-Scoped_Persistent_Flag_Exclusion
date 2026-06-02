@@ -83,6 +83,18 @@ func checkStringOmits(t *testing.T, got, expected string) {
 	}
 }
 
+func checkFlagContains(t *testing.T, got, flag string) {
+	if !strings.Contains(got, flag+" ") && !strings.Contains(got, flag+"\t") && !strings.Contains(got, flag+"=") && !strings.Contains(got, flag+"\n") {
+		t.Errorf("Expected flag %q to be present in output.\nGot:\n%v", flag, got)
+	}
+}
+
+func checkFlagOmits(t *testing.T, got, flag string) {
+	if strings.Contains(got, flag+" ") || strings.Contains(got, flag+"\t") || strings.Contains(got, flag+"=") || strings.Contains(got, flag+"\n") {
+		t.Errorf("Expected flag %q to not be present in output.\nGot:\n%v", flag, got)
+	}
+}
+
 const onetwo = "one two"
 
 func TestSingleCommand(t *testing.T) {
@@ -847,6 +859,33 @@ func TestPersistentFlagsOnChild(t *testing.T) {
 	}
 	if childFlagValue != 7 {
 		t.Errorf("childFlagValue expected: %v, got %v", 7, childFlagValue)
+	}
+}
+
+func TestExcludePersistentFlagPreventsInheritedFlags(t *testing.T) {
+	rootCmd := &Command{Use: "root", Run: emptyRun}
+	parentCmd := &Command{Use: "parent", Run: emptyRun}
+	childCmd := &Command{Use: "child", Run: emptyRun}
+	rootCmd.AddCommand(parentCmd)
+	parentCmd.AddCommand(childCmd)
+
+	rootCmd.PersistentFlags().Bool("rootflag", false, "")
+	parentCmd.PersistentFlags().Bool("parentflag", false, "")
+
+	childCmd.ExcludePersistentFlag("rootflag")
+
+	if childCmd.InheritedFlags().Lookup("rootflag") != nil {
+		t.Errorf("InheritedFlags should not contain excluded flag 'rootflag'")
+	}
+	if childCmd.Flags().Lookup("rootflag") != nil {
+		t.Errorf("Flags should not contain excluded flag 'rootflag'")
+	}
+	if childCmd.InheritedFlags().Lookup("parentflag") == nil {
+		t.Errorf("InheritedFlags expected to contain parent persistent flag 'parentflag'")
+	}
+
+	if childCmd.ExcludedPersistentFlags()[0] != "rootflag" {
+		t.Errorf("ExcludedPersistentFlags expected [rootflag], got %v", childCmd.ExcludedPersistentFlags())
 	}
 }
 

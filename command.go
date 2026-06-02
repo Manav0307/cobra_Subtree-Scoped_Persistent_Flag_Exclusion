@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -164,6 +165,10 @@ type Command struct {
 	iflags *flag.FlagSet
 	// parentsPflags is all persistent flags of cmd's parents.
 	parentsPflags *flag.FlagSet
+	// excludedPersistentFlags holds names of persistent flags excluded from inheritance.
+	excludedPersistentFlags map[string]struct{}
+	// traverseExcludedPersistentFlags holds temporary exclusions that apply during flag traversal.
+	traverseExcludedPersistentFlags map[string]struct{}
 	// globNormFunc is the global normalization function
 	// that we can use on every pflag set and children commands
 	globNormFunc func(f *flag.FlagSet, name string) flag.NormalizedName
@@ -671,6 +676,36 @@ func shortHasNoOptDefVal(name string, fs *flag.FlagSet) bool {
 	return flag.NoOptDefVal != ""
 }
 
+func hasNoOptDefValForCommand(name string, c *Command) bool {
+	if hasNoOptDefVal(name, c.Flags()) {
+		return true
+	}
+	if hasNoOptDefVal(name, c.PersistentFlags()) {
+		return true
+	}
+	for parent := c.Parent(); parent != nil; parent = parent.Parent() {
+		if hasNoOptDefVal(name, parent.PersistentFlags()) {
+			return true
+		}
+	}
+	return false
+}
+
+func shortHasNoOptDefValForCommand(name string, c *Command) bool {
+	if shortHasNoOptDefVal(name, c.Flags()) {
+		return true
+	}
+	if shortHasNoOptDefVal(name, c.PersistentFlags()) {
+		return true
+	}
+	for parent := c.Parent(); parent != nil; parent = parent.Parent() {
+		if shortHasNoOptDefVal(name, parent.PersistentFlags()) {
+			return true
+		}
+	}
+	return false
+}
+
 func stripFlags(args []string, c *Command) []string {
 	if len(args) == 0 {
 		return args
@@ -678,7 +713,6 @@ func stripFlags(args []string, c *Command) []string {
 	c.mergePersistentFlags()
 
 	commands := []string{}
-	flags := c.Flags()
 
 Loop:
 	for len(args) > 0 {
@@ -688,11 +722,11 @@ Loop:
 		case s == "--":
 			// "--" terminates the flags
 			break Loop
-		case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefVal(s[2:], flags):
+		case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefValForCommand(s[2:], c):
 			// If '--flag arg' then
 			// delete arg from args.
 			fallthrough // (do the same as below)
-		case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefVal(s[1:], flags):
+		case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefValForCommand(s[1:], c):
 			// If '-f arg' then
 			// delete 'arg' from args or break the loop if len(args) <= 1.
 			if len(args) <= 1 {
@@ -717,7 +751,6 @@ func (c *Command) argsMinusFirstX(args []string, x string) []string {
 		return args
 	}
 	c.mergePersistentFlags()
-	flags := c.Flags()
 
 Loop:
 	for pos := 0; pos < len(args); pos++ {
@@ -726,9 +759,9 @@ Loop:
 		case s == "--":
 			// -- means we have reached the end of the parseable args. Break out of the loop now.
 			break Loop
-		case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefVal(s[2:], flags):
+		case strings.HasPrefix(s, "--") && !strings.Contains(s, "=") && !hasNoOptDefValForCommand(s[2:], c):
 			fallthrough
-		case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefVal(s[1:], flags):
+		case strings.HasPrefix(s, "-") && !strings.Contains(s, "=") && len(s) == 2 && !shortHasNoOptDefValForCommand(s[1:], c):
 			// This is a flag without a default value, and an equal sign is not used. Increment pos in order to skip
 			// over the next arg, because that is the value of this flag.
 			pos++
@@ -827,11 +860,11 @@ func (c *Command) Traverse(args []string) (*Command, []string, error) {
 		// A long flag with a space separated value
 		case strings.HasPrefix(arg, "--") && !strings.Contains(arg, "="):
 			// TODO: this isn't quite right, we should really check ahead for 'true' or 'false'
-			inFlag = !hasNoOptDefVal(arg[2:], c.Flags())
+			inFlag = !hasNoOptDefValForCommand(arg[2:], c)
 			flags = append(flags, arg)
 			continue
 		// A short flag with a space separated value
-		case strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") && len(arg) == 2 && !shortHasNoOptDefVal(arg[1:], c.Flags()):
+		case strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") && len(arg) == 2 && !shortHasNoOptDefValForCommand(arg[1:], c):
 			inFlag = true
 			flags = append(flags, arg)
 			continue
@@ -851,9 +884,26 @@ func (c *Command) Traverse(args []string) (*Command, []string, error) {
 			return c, args, nil
 		}
 
+		_, _, path := cmd.findCommandPath(args[i+1:])
+		excluded := make(map[string]struct{}, len(c.excludedPersistentFlags))
+		for name := range c.excludedPersistentFlags {
+			excluded[name] = struct{}{}
+		}
+		for _, node := range path {
+			for name := range node.excludedPersistentFlags {
+				excluded[name] = struct{}{}
+			}
+		}
+
+		c.traverseExcludedPersistentFlags = excluded
+		c.resetFlagCache()
 		if err := c.ParseFlags(flags); err != nil {
+			c.traverseExcludedPersistentFlags = nil
+			c.resetFlagCache()
 			return nil, args, err
 		}
+		c.traverseExcludedPersistentFlags = nil
+		c.resetFlagCache()
 		return cmd.Traverse(args[i+1:])
 	}
 	return c, args, nil
@@ -1797,6 +1847,41 @@ func (c *Command) ResetFlags() {
 	c.parentsPflags = nil
 }
 
+// ExcludedPersistentFlags returns the names of parent persistent flags excluded from this command.
+func (c *Command) ExcludedPersistentFlags() []string {
+	if len(c.excludedPersistentFlags) == 0 {
+		return nil
+	}
+
+	flags := make([]string, 0, len(c.excludedPersistentFlags))
+	for name := range c.excludedPersistentFlags {
+		flags = append(flags, name)
+	}
+	sort.Strings(flags)
+	return flags
+}
+
+// ExcludePersistentFlag excludes the named persistent flag from this command's inherited flags.
+func (c *Command) ExcludePersistentFlag(name string) {
+	if c.excludedPersistentFlags == nil {
+		c.excludedPersistentFlags = make(map[string]struct{})
+	}
+	c.excludedPersistentFlags[c.normalizedFlagName(name)] = struct{}{}
+	c.parentsPflags = nil
+	c.iflags = nil
+	c.lflags = nil
+	c.flags = nil
+}
+
+// ClearExcludedPersistentFlag clears all excluded persistent flags for this command.
+func (c *Command) ClearExcludedPersistentFlag() {
+	c.excludedPersistentFlags = nil
+	c.parentsPflags = nil
+	c.iflags = nil
+	c.lflags = nil
+	c.flags = nil
+}
+
 // HasFlags checks if the command contains any flags (local plus persistent from the entire structure).
 func (c *Command) HasFlags() bool {
 	return c.Flags().HasFlags()
@@ -1864,6 +1949,107 @@ func (c *Command) persistentFlag(name string) (flag *flag.Flag) {
 	return
 }
 
+func (c *Command) normalizedFlagName(name string) string {
+	if c.globNormFunc == nil {
+		return name
+	}
+	return string(c.globNormFunc(c.PersistentFlags(), name))
+}
+
+func (c *Command) flagSetInterspersed(fs *flag.FlagSet) bool {
+	val := reflect.ValueOf(fs).Elem().FieldByName("interspersed")
+	if !val.IsValid() {
+		return true
+	}
+	return val.Bool()
+}
+
+func (c *Command) resetFlagCache() {
+	if c.flags != nil {
+		localFlags := flag.NewFlagSet(c.DisplayName(), flag.ContinueOnError)
+		if c.flagErrorBuf == nil {
+			c.flagErrorBuf = new(bytes.Buffer)
+		}
+		localFlags.SetOutput(c.flagErrorBuf)
+		localFlags.SortFlags = c.Flags().SortFlags
+		localFlags.SetInterspersed(c.flagSetInterspersed(c.Flags()))
+		if c.globNormFunc != nil {
+			localFlags.SetNormalizeFunc(c.globNormFunc)
+		}
+
+		c.Flags().VisitAll(func(f *flag.Flag) {
+			if pf := c.PersistentFlags().Lookup(f.Name); pf == f {
+				return
+			}
+			if c.parentsPflags != nil {
+				if ppf := c.parentsPflags.Lookup(f.Name); ppf == f {
+					return
+				}
+			}
+			localFlags.AddFlag(f)
+		})
+
+		c.flags = localFlags
+	}
+
+	c.parentsPflags = nil
+	c.lflags = nil
+	c.iflags = nil
+}
+
+func (c *Command) addFlagSetWithExclusions(dest, src *flag.FlagSet, excluded map[string]struct{}) {
+	src.VisitAll(func(f *flag.Flag) {
+		if _, skip := excluded[f.Name]; !skip {
+			dest.AddFlag(f)
+		}
+	})
+}
+
+func (c *Command) excludedPersistentFlagNames() map[string]struct{} {
+	excluded := make(map[string]struct{}, len(c.excludedPersistentFlags)+len(c.traverseExcludedPersistentFlags))
+	for name := range c.excludedPersistentFlags {
+		excluded[name] = struct{}{}
+	}
+	for name := range c.traverseExcludedPersistentFlags {
+		excluded[name] = struct{}{}
+	}
+	return excluded
+}
+
+func (c *Command) findCommandPath(args []string) (*Command, []string, []*Command) {
+	flags := []string{}
+	inFlag := false
+
+	for i, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "--") && !strings.Contains(arg, "="):
+			inFlag = !hasNoOptDefValForCommand(arg[2:], c)
+			flags = append(flags, arg)
+			continue
+		case strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") && len(arg) == 2 && !shortHasNoOptDefValForCommand(arg[1:], c):
+			inFlag = true
+			flags = append(flags, arg)
+			continue
+		case inFlag:
+			inFlag = false
+			flags = append(flags, arg)
+			continue
+		case isFlagArg(arg):
+			flags = append(flags, arg)
+			continue
+		}
+
+		cmd := c.findNext(arg)
+		if cmd == nil {
+			return c, args, nil
+		}
+
+		leaf, rest, path := cmd.findCommandPath(args[i+1:])
+		return leaf, rest, append([]*Command{cmd}, path...)
+	}
+	return c, args, nil
+}
+
 // ParseFlags parses persistent flag tree and local flags.
 func (c *Command) ParseFlags(args []string) error {
 	if c.DisableFlagParsing {
@@ -1896,29 +2082,80 @@ func (c *Command) Parent() *Command {
 // mergePersistentFlags merges c.PersistentFlags() to c.Flags()
 // and adds missing persistent flags of all parents.
 func (c *Command) mergePersistentFlags() {
+	excluded := c.excludedPersistentFlagNames()
 	c.updateParentsPflags()
-	c.Flags().AddFlagSet(c.PersistentFlags())
+
+	if c.flagErrorBuf == nil {
+		c.flagErrorBuf = new(bytes.Buffer)
+	}
+
+	localFlags := flag.NewFlagSet(c.DisplayName(), flag.ContinueOnError)
+	localFlags.SetOutput(c.flagErrorBuf)
+	localFlags.SortFlags = c.Flags().SortFlags
+	localFlags.SetInterspersed(c.flagSetInterspersed(c.Flags()))
+	if c.globNormFunc != nil {
+		localFlags.SetNormalizeFunc(c.globNormFunc)
+	}
+
+	if c.flags != nil {
+		c.Flags().VisitAll(func(f *flag.Flag) {
+			if pf := c.PersistentFlags().Lookup(f.Name); pf == f {
+				return
+			}
+			if c.parentsPflags != nil {
+				if ppf := c.parentsPflags.Lookup(f.Name); ppf == f {
+					return
+				}
+			}
+			localFlags.AddFlag(f)
+		})
+	}
+
+	c.flags = localFlags
+	if len(excluded) > 0 {
+		c.addFlagSetWithExclusions(c.Flags(), c.PersistentFlags(), excluded)
+	} else {
+		c.Flags().AddFlagSet(c.PersistentFlags())
+	}
 	c.Flags().AddFlagSet(c.parentsPflags)
+	c.Flags().AddFlagSet(flag.CommandLine)
 }
 
 // updateParentsPflags updates c.parentsPflags by adding
 // new persistent flags of all parents.
 // If c.parentsPflags == nil, it makes new.
 func (c *Command) updateParentsPflags() {
-	if c.parentsPflags == nil {
-		c.parentsPflags = flag.NewFlagSet(c.DisplayName(), flag.ContinueOnError)
-		c.parentsPflags.SetOutput(c.flagErrorBuf)
-		c.parentsPflags.SortFlags = false
+	if c.flagErrorBuf == nil {
+		c.flagErrorBuf = new(bytes.Buffer)
 	}
+	c.parentsPflags = flag.NewFlagSet(c.DisplayName(), flag.ContinueOnError)
+	c.parentsPflags.SetOutput(c.flagErrorBuf)
+	c.parentsPflags.SortFlags = false
 
 	if c.globNormFunc != nil {
 		c.parentsPflags.SetNormalizeFunc(c.globNormFunc)
 	}
 
-	c.Root().PersistentFlags().AddFlagSet(flag.CommandLine)
+	excluded := make(map[string]struct{}, len(c.excludedPersistentFlags))
+	for name := range c.excludedPersistentFlags {
+		excluded[name] = struct{}{}
+	}
 
+	added := make(map[string]struct{})
 	c.VisitParents(func(parent *Command) {
-		c.parentsPflags.AddFlagSet(parent.PersistentFlags())
+		for name := range parent.excludedPersistentFlags {
+			excluded[name] = struct{}{}
+		}
+		parent.PersistentFlags().VisitAll(func(f *flag.Flag) {
+			if _, skip := excluded[f.Name]; skip {
+				return
+			}
+			if _, seen := added[f.Name]; seen {
+				return
+			}
+			c.parentsPflags.AddFlag(f)
+			added[f.Name] = struct{}{}
+		})
 	})
 }
 

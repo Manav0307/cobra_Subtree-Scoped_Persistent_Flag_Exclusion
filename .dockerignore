@@ -1,0 +1,5 @@
+# Reduce build context size without breaking git or Go module files.
+.github
+site
+WORKFLOW*.md
+DOCKER.md
